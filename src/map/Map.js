@@ -8,7 +8,9 @@ L.Map = L.Class.extend({
 	options: {
 		// projection
 		crs: L.CRS.EPSG3857 || L.CRS.EPSG4326,
-		scale: function (zoom) { return 256 * Math.pow(2, zoom); },
+		scale: function (zoom) {
+			return 256 * Math.pow(2, zoom);
+		},
 
 		// state
 		center: null,
@@ -20,7 +22,7 @@ L.Map = L.Class.extend({
 		touchZoom: L.Browser.touch && !L.Browser.android,
 		scrollWheelZoom: !L.Browser.touch,
 		doubleClickZoom: true,
-		shiftDragZoom: true,
+		boxZoom: true,
 
 		// controls
 		zoomControl: true,
@@ -53,8 +55,16 @@ L.Map = L.Class.extend({
 
 		if (L.DomEvent) {
 			this._initEvents();
-			if (L.Handler) { this._initInteraction(); }
-			if (L.Control) { this._initControls(); }
+			if (L.Handler) {
+				this._initInteraction();
+			}
+			if (L.Control) {
+				this._initControls();
+			}
+		}
+
+		if (this.options.maxBounds) {
+			this.setMaxBounds(this.options.maxBounds);
 		}
 
 		var center = this.options.center,
@@ -119,10 +129,59 @@ L.Map = L.Class.extend({
 		return this;
 	},
 
+	setMaxBounds: function (bounds) {
+		this.options.maxBounds = bounds;
+
+		if (!bounds) {
+			this._boundsMinZoom = null;
+			return this;
+		}
+
+		var minZoom = this.getBoundsZoom(bounds, true);
+
+		this._boundsMinZoom = minZoom;
+
+		if (this._loaded) {
+			if (this._zoom < minZoom) {
+				this.setView(bounds.getCenter(), minZoom);
+			} else {
+				this.panInsideBounds(bounds);
+			}
+		}
+		return this;
+	},
+
+	panInsideBounds: function (bounds) {
+		var viewBounds = this.getBounds(),
+			viewSw = this.project(viewBounds.getSouthWest()),
+			viewNe = this.project(viewBounds.getNorthEast()),
+			sw = this.project(bounds.getSouthWest()),
+			ne = this.project(bounds.getNorthEast()),
+			dx = 0,
+			dy = 0;
+
+		if (viewNe.y < ne.y) { // north
+			dy = ne.y - viewNe.y;
+		}
+		if (viewNe.x > ne.x) { // east
+			dx = ne.x - viewNe.x;
+		}
+		if (viewSw.y > sw.y) { // south
+			dy = sw.y - viewSw.y;
+		}
+		if (viewSw.x < sw.x) { // west
+			dx = sw.x - viewSw.x;
+		}
+
+		return this.panBy(new L.Point(dx, dy, true));
+	},
+
 	addLayer: function (layer, insertAtTheTop) {
 		var id = L.Util.stamp(layer);
 
-		if (this._layers[id]) { return this; }
+		if (this._layers[id]) {
+			return this;
+		}
 
 		this._layers[id] = layer;
 
@@ -182,10 +241,18 @@ L.Map = L.Class.extend({
 	},
 
 	invalidateSize: function () {
-		if (!this._loaded) { return this; }
-
 		var oldSize = this.getSize();
+
 		this._sizeChanged = true;
+
+		if (this.options.maxBounds) {
+			this.setMaxBounds(this.options.maxBounds);
+		}
+
+		if (!this._loaded) {
+			return this;
+		}
+
 		this._rawPanBy(oldSize.subtract(this.getSize()).divideBy(2));
 
 		this.fire('move');
@@ -213,38 +280,59 @@ L.Map = L.Class.extend({
 
 	getBounds: function () {
 		var bounds = this.getPixelBounds(),
-			sw = this.unproject(new L.Point(bounds.min.x, bounds.max.y)),
-			ne = this.unproject(new L.Point(bounds.max.x, bounds.min.y));
+			sw = this.unproject(new L.Point(bounds.min.x, bounds.max.y), this._zoom, true),
+			ne = this.unproject(new L.Point(bounds.max.x, bounds.min.y), this._zoom, true);
 		return new L.LatLngBounds(sw, ne);
 	},
 
 	getMinZoom: function () {
-		return isNaN(this.options.minZoom) ?  this._layersMinZoom || 0 : this.options.minZoom;
+		var z1 = this.options.minZoom || 0,
+			z2 = this._layersMinZoom || 0,
+			z3 = this._boundsMinZoom || 0;
+
+		return Math.max(z1, z2, z3);
 	},
 
 	getMaxZoom: function () {
-		return isNaN(this.options.maxZoom) ?  this._layersMaxZoom || Infinity : this.options.maxZoom;
+		var z1 = isNaN(this.options.maxZoom) ? Infinity : this.options.maxZoom,
+			z2 = this._layersMaxZoom || Infinity;
+
+		return Math.min(z1, z2);
 	},
 
-	getBoundsZoom: function (bounds) { // (LatLngBounds)
+	getBoundsZoom: function (bounds, inside) { // (LatLngBounds)
 		var size = this.getSize(),
-			zoom = this.getMinZoom(),
+			zoom = this.options.minZoom || 0,
 			maxZoom = this.getMaxZoom(),
 			ne = bounds.getNorthEast(),
 			sw = bounds.getSouthWest(),
 			boundsSize,
 			nePoint,
-			swPoint;
+			swPoint,
+			zoomNotFound = true;
+
+		if (inside) {
+			zoom--;
+		}
 
 		do {
 			zoom++;
 			nePoint = this.project(ne, zoom);
 			swPoint = this.project(sw, zoom);
 			boundsSize = new L.Point(nePoint.x - swPoint.x, swPoint.y - nePoint.y);
-		} while ((boundsSize.x <= size.x) &&
-		         (boundsSize.y <= size.y) && (zoom <= maxZoom));
 
-		return zoom - 1;
+			if (!inside) {
+				zoomNotFound = (boundsSize.x <= size.x) && (boundsSize.y <= size.y);
+			} else {
+				zoomNotFound = (boundsSize.x < size.x) || (boundsSize.y < size.y);
+			}
+		} while (zoomNotFound && (zoom <= maxZoom));
+
+		if (zoomNotFound && inside) {
+			return null;
+		}
+
+		return inside ? zoom : zoom - 1;
 	},
 
 	getSize: function () {
@@ -331,7 +419,9 @@ L.Map = L.Class.extend({
 
 		this._initPanes();
 
-		if (this._initControlPos) { this._initControlPos(); }
+		if (this._initControlPos) {
+			this._initControlPos();
+		}
 	},
 
 	_initPanes: function () {
@@ -352,10 +442,16 @@ L.Map = L.Class.extend({
 		return L.DomUtil.create('div', className, container || this._objectsPane);
 	},
 
-	_resetView: function (center, zoom, preserveMapOffset) {
+	_resetView: function (center, zoom, preserveMapOffset, afterZoomAnim) {
 		var zoomChanged = (this._zoom !== zoom);
 
-		this.fire('movestart');
+		if (!afterZoomAnim) {
+			this.fire('movestart');
+
+			if (zoomChanged) {
+				this.fire('zoomstart');
+			}
+		}
 
 		this._zoom = zoom;
 
@@ -372,7 +468,9 @@ L.Map = L.Class.extend({
 		this.fire('viewreset', {hard: !preserveMapOffset});
 
 		this.fire('move');
-		if (zoomChanged) { this.fire('zoomend'); }
+		if (zoomChanged || afterZoomAnim) {
+			this.fire('zoomend');
+		}
 		this.fire('moveend');
 
 		if (!this._loaded) {
@@ -430,19 +528,25 @@ L.Map = L.Class.extend({
 	},
 
 	_onMouseClick: function (e) {
-		if (!this._loaded || (this.dragging && this.dragging.moved())) { return; }
+		if (!this._loaded || (this.dragging && this.dragging.moved())) {
+			return;
+		}
 
 		this.fire('pre' + e.type);
 		this._fireMouseEvent(e);
 	},
 
 	_fireMouseEvent: function (e) {
-		if (!this._loaded) { return; }
+		if (!this._loaded) {
+			return;
+		}
 
 		var type = e.type;
 		type = (type === 'mouseenter' ? 'mouseover' : (type === 'mouseleave' ? 'mouseout' : type));
 
-		if (!this.hasEventListeners(type)) { return; }
+		if (!this.hasEventListeners(type)) {
+			return;
+		}
 
 		this.fire(type, {
 			latlng: this.mouseEventToLatLng(e),
@@ -452,18 +556,21 @@ L.Map = L.Class.extend({
 
 	_initInteraction: function () {
 		var handlers = {
-			dragging: L.Handler.MapDrag,
-			touchZoom: L.Handler.TouchZoom,
-			doubleClickZoom: L.Handler.DoubleClickZoom,
-			scrollWheelZoom: L.Handler.ScrollWheelZoom,
-			shiftDragZoom: L.Handler.ShiftDragZoom
+			dragging: L.Map.Drag,
+			touchZoom: L.Map.TouchZoom,
+			doubleClickZoom: L.Map.DoubleClickZoom,
+			scrollWheelZoom: L.Map.ScrollWheelZoom,
+			boxZoom: L.Map.BoxZoom
 		};
-		var i;
 
+		var i;
 		for (i in handlers) {
 			if (handlers.hasOwnProperty(i) && handlers[i]) {
 				this[i] = new handlers[i](this);
-				if (this.options[i]) { this[i].enable(); }
+				if (this.options[i]) {
+					this[i].enable();
+				}
+				// TODO move enabling to handler contructor
 			}
 		}
 	},
